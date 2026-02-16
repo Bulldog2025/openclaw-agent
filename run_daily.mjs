@@ -14,6 +14,7 @@ import {
 import { enrichLeadsOpenAI } from "./lib/openai_enrich.mjs";
 import { formatLeadsEmail } from "./lib/email_format.mjs";
 import { buildQueriesForMetro } from "./lib/query_templates.mjs";
+import { sendRun } from "./lib/gmail_send.mjs";
 
 /**
  * Daily orchestrator.
@@ -26,10 +27,10 @@ import { buildQueriesForMetro } from "./lib/query_templates.mjs";
  * 5) Select top N fresh (offline)
  * 6) Optional OpenAI enrichment (network) — extraction/formatting only
  * 7) Produce email payload + preview (offline)
- * 8) Write artifacts + logs (offline)
+ * 8) Stage pending history (offline)
+ * 9) (Optional) Send + commit (network + offline commit)
  *
- * NOTE: We currently append to sent history at selection time.
- * Later, after Gmail send is integrated, move appendSentHistory to AFTER send succeeds.
+ * NOTE: History is staged in-runDir and committed ONLY after send succeeds.
  */
 
 const RUN_STATUS = {
@@ -38,18 +39,6 @@ const RUN_STATUS = {
   SENT: "SENT",
   COMMITTED: "COMMITTED",
 };
-
-function writeRunState(runDir, patch) {
-  const p = path.join(runDir, "state.json");
-  const prev = readJsonIfExists(p, {});
-  const next = {
-    ...prev,
-    ...patch,
-    updated_at: new Date().toISOString(),
-  };
-  writeJson(p, next);
-  return next;
-}
 
 function utcDateStamp() {
   const d = new Date();
@@ -157,11 +146,45 @@ function uniqueByFingerprint(scored) {
   return out;
 }
 
+function writeRunState(runDir, patch) {
+  const p = path.join(runDir, "state.json");
+  const prev = readJsonIfExists(p, {});
+  const next = {
+    ...prev,
+    ...patch,
+    updated_at: new Date().toISOString(),
+  };
+  writeJson(p, next);
+  return next;
+}
+
 async function main() {
   // ---------- config ----------
   const leadsPerRun = Number(getArg("--limit") ?? "10");
   const countPerQuery = Number(getArg("--count") ?? "20");
   const skipEnrich = process.argv.includes("--skip-enrich");
+
+  const sendFlag = process.argv.includes("--send");
+  const toArg = getArg("--to");
+  const to2Arg = getArg("--to2");
+
+  let recipients = [];
+  if (sendFlag) {
+    if (toArg) {
+      recipients = toArg
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    if (to2Arg) recipients.push(to2Arg.trim());
+    recipients = Array.from(new Set(recipients));
+
+    if (recipients.length < 1) {
+      throw new Error(
+        'When using --send, provide recipients: --to "a@x.com,b@y.com" (optional --to2 "c@z.com")'
+      );
+    }
+  }
 
   ensureDir("state");
   ensureDir("reports");
@@ -183,7 +206,15 @@ async function main() {
   const log = (event, data = {}) =>
     appendJsonl(logPath, { ts: new Date().toISOString(), event, ...data });
 
-  log("run_start", { date, metro, runId, leadsPerRun, countPerQuery, skipEnrich });
+  log("run_start", {
+    date,
+    metro,
+    runId,
+    leadsPerRun,
+    countPerQuery,
+    skipEnrich,
+    send: sendFlag,
+  });
 
   writeRunState(runDir, {
     status: RUN_STATUS.STARTED,
@@ -195,9 +226,9 @@ async function main() {
     skipEnrich,
     leadsPerRun,
     countPerQuery,
+    send: sendFlag,
   });
   log("state_update", { status: RUN_STATUS.STARTED });
-  
 
   // ---------- query fallback: accumulate candidates until enough fresh ----------
   const queries = buildQueriesForMetro(metro);
@@ -216,10 +247,8 @@ async function main() {
     const ranked = scoreResults(results, { metro });
     log("query_score_ok", { i, q, ranked_count: ranked.length });
 
-    // merge and de-dupe by fingerprint
     mergedRanked = uniqueByFingerprint([...mergedRanked, ...ranked]);
 
-    // compute fresh so far to decide whether to continue
     const { fresh } = filterNewCandidates(mergedRanked, sentSet);
 
     perQueryArtifacts.push({
@@ -236,10 +265,8 @@ async function main() {
     if (fresh.length >= leadsPerRun) break;
   }
 
-  // Sort merged by score desc (scoreResults already sorted per query, but merge breaks order)
   mergedRanked.sort((a, b) => b.score - a.score);
 
-  // Final dedup decision
   const { fresh, skipped } = filterNewCandidates(mergedRanked, sentSet);
   const selected = fresh.slice(0, leadsPerRun);
 
@@ -268,53 +295,25 @@ async function main() {
     skipped_total: skipped.length,
   });
 
-  // Stage history entries for later commit (after Gmail send succeeds)
-  const runExec = path.basename(runDir); // e.g. 20260212T060957Z_f7982ae1a511320c
-
-  const pendingHistory = selected.map((c) => ({
-    ts: new Date().toISOString(),
-    fingerprint: c.fingerprint,
-    host: c.host,
-    title: c.title,
-    url: c.url,
-    metro,
-    runId,
-    runDir,   // <-- NEW: unique per execution
-    runExec,  // <-- NEW: convenient key
-    extra: { stage: "selected" },
-  }));
-  
-
-  writeJson(path.join(runDir, "pending_sent_history.json"), {
-    metro,
-    runId,
-    pending_count: pendingHistory.length,
-    entries: pendingHistory,
-  });
-
-  log("history_staged", { pending_count: pendingHistory.length });
-
-  writeRunState(runDir, {
-    pending_commit: { sent_history_entries: pendingHistory.length },
-  });
-
-
   // ---------- step: OpenAI enrichment (optional; never crash run) ----------
   let enriched = [];
   let enrichError = null;
-  let model;
 
-  
+  if (skipEnrich) {
+    log("enrich_skipped", { reason: "--skip-enrich provided" });
+  } else {
+    let model;
     try {
       model = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+      log("enrich_start", { model, selected_count: selected.length });
       enriched = await enrichLeadsOpenAI({ selected, metro, runId, model });
-      log("enrich_ok", { enriched_count: enriched.length });
+      log("enrich_ok", { model, enriched_count: enriched.length });
     } catch (err) {
       enrichError = errToObj(err);
-      log("enrich_error", enrichError);
+      log("enrich_error", { model: model ?? null, ...enrichError });
       enriched = [];
     }
-  
+  }
 
   writeJson(path.join(runDir, "enriched_leads.json"), { metro, runId, enriched });
   if (enrichError) writeJson(path.join(runDir, "enrich_error.json"), enrichError);
@@ -340,12 +339,53 @@ async function main() {
 
   log("email_format_ok", { mode: emailMode, subject: emailPayload.subject });
 
+  // ---------- state update: GENERATED ----------
   writeRunState(runDir, {
     status: RUN_STATUS.GENERATED,
     email: { mode: emailMode, subject: emailPayload.subject },
   });
   log("state_update", { status: RUN_STATUS.GENERATED, email_mode: emailMode });
-  
+
+  // ---------- stage history entries for later commit ----------
+  const runExec = path.basename(runDir);
+  const pendingHistory = selected.map((c) => ({
+    ts: new Date().toISOString(),
+    fingerprint: c.fingerprint,
+    host: c.host,
+    title: c.title,
+    url: c.url,
+    metro,
+    runId,
+    runDir,
+    runExec,
+    extra: { stage: "selected" },
+  }));
+
+  writeJson(path.join(runDir, "pending_sent_history.json"), {
+    metro,
+    runId,
+    runDir,
+    runExec,
+    pending_count: pendingHistory.length,
+    entries: pendingHistory,
+  });
+
+  log("history_staged", { pending_count: pendingHistory.length });
+
+  writeRunState(runDir, {
+    pending_commit: { sent_history_entries: pendingHistory.length },
+  });
+
+  // ---------- optional: send + commit (atomic daily entrypoint) ----------
+  let sendResult = null;
+  if (sendFlag) {
+    log("send_start", { recipients });
+
+    // If sending fails, throw -> process exits non-zero -> systemd retry-safe
+    sendResult = await sendRun({ runDir, recipients });
+
+    log("send_complete", sendResult);
+  }
 
   // ---------- run metadata ----------
   writeJson(path.join(runDir, "run.json"), {
@@ -367,6 +407,7 @@ async function main() {
       mode: emailMode,
       subject: emailPayload.subject,
     },
+    send: sendFlag ? { recipients, result: sendResult } : null,
     queries_tried: perQueryArtifacts,
   });
 
@@ -375,6 +416,7 @@ async function main() {
     enriched_count: enriched.length,
     email_mode: emailMode,
     runDir,
+    sent: !!sendResult?.ok,
   });
 
   console.log(
@@ -388,6 +430,7 @@ async function main() {
         email_mode: emailMode,
         email_subject: emailPayload.subject,
         runDir,
+        sent: !!sendResult?.ok,
       },
       null,
       2
