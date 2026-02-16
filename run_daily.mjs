@@ -10,7 +10,6 @@ import { scoreResults } from "./lib/score_leads.mjs";
 import {
   loadSentFingerprints,
   filterNewCandidates,
-  appendSentHistory,
 } from "./lib/state_history.mjs";
 import { enrichLeadsOpenAI } from "./lib/openai_enrich.mjs";
 import { formatLeadsEmail } from "./lib/email_format.mjs";
@@ -32,6 +31,25 @@ import { buildQueriesForMetro } from "./lib/query_templates.mjs";
  * NOTE: We currently append to sent history at selection time.
  * Later, after Gmail send is integrated, move appendSentHistory to AFTER send succeeds.
  */
+
+const RUN_STATUS = {
+  STARTED: "STARTED",
+  GENERATED: "GENERATED",
+  SENT: "SENT",
+  COMMITTED: "COMMITTED",
+};
+
+function writeRunState(runDir, patch) {
+  const p = path.join(runDir, "state.json");
+  const prev = readJsonIfExists(p, {});
+  const next = {
+    ...prev,
+    ...patch,
+    updated_at: new Date().toISOString(),
+  };
+  writeJson(p, next);
+  return next;
+}
 
 function utcDateStamp() {
   const d = new Date();
@@ -167,6 +185,20 @@ async function main() {
 
   log("run_start", { date, metro, runId, leadsPerRun, countPerQuery, skipEnrich });
 
+  writeRunState(runDir, {
+    status: RUN_STATUS.STARTED,
+    runId,
+    date,
+    metro,
+    querySeed,
+    created_at: new Date().toISOString(),
+    skipEnrich,
+    leadsPerRun,
+    countPerQuery,
+  });
+  log("state_update", { status: RUN_STATUS.STARTED });
+  
+
   // ---------- query fallback: accumulate candidates until enough fresh ----------
   const queries = buildQueriesForMetro(metro);
   const sentSet = loadSentFingerprints();
@@ -236,18 +268,36 @@ async function main() {
     skipped_total: skipped.length,
   });
 
-  // Mark as sent at selection time (temporary)
-  for (const c of selected) {
-    appendSentHistory({
-      fingerprint: c.fingerprint,
-      host: c.host,
-      title: c.title,
-      url: c.url,
-      metro,
-      runId,
-      extra: { stage: "selected" },
-    });
-  }
+  // Stage history entries for later commit (after Gmail send succeeds)
+  const runExec = path.basename(runDir); // e.g. 20260212T060957Z_f7982ae1a511320c
+
+  const pendingHistory = selected.map((c) => ({
+    ts: new Date().toISOString(),
+    fingerprint: c.fingerprint,
+    host: c.host,
+    title: c.title,
+    url: c.url,
+    metro,
+    runId,
+    runDir,   // <-- NEW: unique per execution
+    runExec,  // <-- NEW: convenient key
+    extra: { stage: "selected" },
+  }));
+  
+
+  writeJson(path.join(runDir, "pending_sent_history.json"), {
+    metro,
+    runId,
+    pending_count: pendingHistory.length,
+    entries: pendingHistory,
+  });
+
+  log("history_staged", { pending_count: pendingHistory.length });
+
+  writeRunState(runDir, {
+    pending_commit: { sent_history_entries: pendingHistory.length },
+  });
+
 
   // ---------- step: OpenAI enrichment (optional; never crash run) ----------
   let enriched = [];
@@ -289,6 +339,13 @@ async function main() {
   writeText(path.join(runDir, "email_preview.txt"), emailPayload.bodyText);
 
   log("email_format_ok", { mode: emailMode, subject: emailPayload.subject });
+
+  writeRunState(runDir, {
+    status: RUN_STATUS.GENERATED,
+    email: { mode: emailMode, subject: emailPayload.subject },
+  });
+  log("state_update", { status: RUN_STATUS.GENERATED, email_mode: emailMode });
+  
 
   // ---------- run metadata ----------
   writeJson(path.join(runDir, "run.json"), {
